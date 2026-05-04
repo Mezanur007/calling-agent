@@ -23,11 +23,17 @@ async def handle_call(websocket: WebSocket):
     audio_task = None
     conv_task = None
 
+    audio_count = 0
     async def receive_audio():
+        nonlocal audio_count
         while True:
             try:
                 data = await websocket.receive()
                 if "bytes" in data:
+                    audio_count += 1
+                    if audio_count % 50 == 0:
+                        print(f"[Audio] Received {audio_count} chunks "
+                              f"({len(data['bytes'])} bytes each)")
                     await stt.send_audio(data["bytes"])
                 elif "text" in data:
                     msg = json.loads(data["text"])
@@ -39,6 +45,7 @@ async def handle_call(websocket: WebSocket):
 
     async def conversation_loop():
         nonlocal connected
+        silence_count = 0
 
         try:
             greeting = (
@@ -147,8 +154,29 @@ async def handle_call(websocket: WebSocket):
                         })
                         conv.add_to_transcript("Agent", agent_text)
 
-                elif transcript is None and not conv.done:
-                    continue
+                    silence_count = 0
+
+                elif transcript is None:
+                    silence_count += 1
+                    if silence_count >= 3:
+                        prompt_text = (
+                            "I didn't quite catch that. Could you please say it again "
+                            "clearly and make sure your microphone is working?"
+                        )
+                        prompt_audio = await text_to_speech(prompt_text)
+                        await websocket.send_json({
+                            "type": "audio",
+                            "payload": base64.b64encode(prompt_audio).decode("utf-8"),
+                        })
+                        await websocket.send_json({
+                            "type": "transcript",
+                            "speaker": "Agent",
+                            "text": prompt_text,
+                        })
+                        conv.add_to_transcript("Agent", prompt_text)
+                        silence_count = 0
+                else:
+                    silence_count = 0
 
                 await asyncio.sleep(0.01)
 

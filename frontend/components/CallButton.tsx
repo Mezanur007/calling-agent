@@ -106,7 +106,7 @@ export default function CallButton({ onTranscript, onStatusChange }: Props) {
       })
       streamRef.current = stream
 
-      const ctx = new AudioContext({ sampleRate: 24000 })
+      const ctx = new AudioContext({ sampleRate: 16000 })
       ctxRef.current = ctx
 
       const gain = ctx.createGain()
@@ -127,7 +127,11 @@ export default function CallButton({ onTranscript, onStatusChange }: Props) {
         const processor = ctx.createScriptProcessor(4096, 1, 1)
         workletRef.current = processor
         source.connect(processor)
-        processor.connect(ctx.destination)
+
+        const silentGain = ctx.createGain()
+        silentGain.gain.value = 0
+        processor.connect(silentGain)
+        silentGain.connect(ctx.destination)
 
         processor.onaudioprocess = (e) => {
           const input = e.inputBuffer.getChannelData(0)
