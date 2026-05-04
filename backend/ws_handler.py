@@ -16,202 +16,159 @@ async def handle_call(websocket: WebSocket):
     await websocket.accept()
     print("[WS] Call connected")
 
-    stt = DeepgramSTT()
+    try:
+        init_msg = await asyncio.wait_for(websocket.receive_json(), timeout=10)
+        sample_rate = init_msg.get("sampleRate", 48000)
+        print(f"[WS] Browser sample rate: {sample_rate} Hz")
+    except Exception as e:
+        print(f"[WS] No init message: {e}")
+        sample_rate = 48000
+
+    stt = DeepgramSTT(sample_rate=sample_rate)
     agent = LLMAgent()
     conv = ConversationManager()
-    connected = False
-    audio_task = None
-    conv_task = None
-
+    silence_count = 0
     audio_count = 0
-    audio_bytes_total = 0
+
+    try:
+        await stt.connect()
+        print("[Deepgram] Connected")
+    except Exception as e:
+        print(f"[Deepgram] Connection failed: {e}")
+        await websocket.close()
+        return
+
+    greeting = (
+        f"Hello, and welcome to {restaurant_name}! "
+        f"This is the automated booking assistant. "
+        f"Are you looking to book a table or place a takeaway order today?"
+    )
+
+    try:
+        greeting_audio = await text_to_speech(greeting)
+        await websocket.send_json({
+            "type": "audio",
+            "payload": base64.b64encode(greeting_audio).decode("utf-8"),
+        })
+        await websocket.send_json({
+            "type": "transcript",
+            "speaker": "Agent",
+            "text": greeting,
+        })
+        conv.add_to_transcript("Agent", greeting)
+    except Exception as e:
+        print(f"[TTS] Greeting error: {e}")
+
     async def receive_audio():
-        nonlocal audio_count, audio_bytes_total
-        while True:
+        nonlocal audio_count
+        while not conv.done:
             try:
-                data = await websocket.receive()
+                data = await asyncio.wait_for(websocket.receive(), timeout=0.2)
                 if "bytes" in data:
                     audio_count += 1
-                    audio_bytes_total += len(data["bytes"])
                     if audio_count == 1:
-                        print(f"[Audio] First audio chunk received: {len(data['bytes'])} bytes")
+                        print(f"[Audio] First chunk received: {len(data['bytes'])} bytes")
                     if audio_count % 100 == 0:
-                        print(f"[Audio] Received {audio_count} chunks ({audio_bytes_total} bytes total)")
-                    await stt.send_audio(data["bytes"])
+                        print(f"[Audio] {audio_count} chunks received")
+                    try:
+                        stt.send_audio(data["bytes"])
+                    except Exception as e:
+                        print(f"[Audio] Send error: {e}")
                 elif "text" in data:
                     msg = json.loads(data["text"])
                     if msg.get("type") == "end":
                         conv.done = True
                         break
+            except asyncio.TimeoutError:
+                pass
             except Exception as e:
                 print(f"[Audio] Receive error: {e}")
                 break
 
-    async def conversation_loop():
-        nonlocal connected
-        silence_count = 0
-
+    async def speak(text: str):
+        conv.add_to_transcript("Agent", text)
         try:
-            greeting = (
-                f"Hello, and welcome to {restaurant_name}! "
-                f"This is the automated booking assistant. "
-                f"Are you looking to book a table or place a takeaway order today?"
-            )
-            greeting_audio = await text_to_speech(greeting)
-
+            audio = await text_to_speech(text)
             await websocket.send_json({
                 "type": "audio",
-                "payload": base64.b64encode(greeting_audio).decode("utf-8"),
+                "payload": base64.b64encode(audio).decode("utf-8"),
             })
-            await websocket.send_json({
-                "type": "transcript",
-                "speaker": "Agent",
-                "text": greeting,
-            })
-            conv.add_to_transcript("Agent", greeting)
-
-            while not conv.done:
-                transcript = await stt.receive_transcript()
-
-                if transcript and transcript.get("is_final") and transcript.get("text"):
-                    user_text = transcript["text"]
-                    print(f"[User] {user_text}")
-                    conv.add_to_transcript("Customer", user_text)
-                    await websocket.send_json({
-                        "type": "transcript",
-                        "speaker": "Customer",
-                        "text": user_text,
-                    })
-
-                    agent.add_user_message(user_text)
-
-                    try:
-                        result = await agent.get_response()
-                    except Exception as e:
-                        print(f"[LLM] Error: {e}")
-                        error_msg = "I'm sorry, I had trouble understanding. Could you repeat that?"
-                        error_audio = await text_to_speech(error_msg)
-                        await websocket.send_json({
-                            "type": "audio",
-                            "payload": base64.b64encode(error_audio).decode("utf-8"),
-                        })
-                        await websocket.send_json({
-                            "type": "transcript",
-                            "speaker": "Agent",
-                            "text": error_msg,
-                        })
-                        continue
-
-                    if result.get("extracted_booking"):
-                        conv.set_booking(result["extracted_booking"])
-                        summary = conv.get_booking_summary()
-                        confirmation_text = (
-                            f"Let me confirm your booking:\n\n{summary}\n\n"
-                            f"Does everything look correct? Please say 'yes' to confirm "
-                            f"or let me know what needs to change."
-                        )
-                        confirmation_audio = await text_to_speech(confirmation_text)
-                        await websocket.send_json({
-                            "type": "audio",
-                            "payload": base64.b64encode(confirmation_audio).decode("utf-8"),
-                        })
-                        await websocket.send_json({
-                            "type": "transcript",
-                            "speaker": "Agent",
-                            "text": confirmation_text,
-                        })
-                        conv.add_to_transcript("Agent", confirmation_text)
-
-                    elif result.get("done") and result.get("confirmed"):
-                        conv.confirmed = True
-                        final_text = (
-                            f"Perfect! Your booking is confirmed. Thank you for choosing "
-                            f"{restaurant_name}. We look forward to serving you. Have a wonderful day!"
-                        )
-                        final_audio = await text_to_speech(final_text)
-                        await websocket.send_json({
-                            "type": "audio",
-                            "payload": base64.b64encode(final_audio).decode("utf-8"),
-                        })
-                        await websocket.send_json({
-                            "type": "transcript",
-                            "speaker": "Agent",
-                            "text": final_text,
-                        })
-                        conv.add_to_transcript("Agent", final_text)
-
-                    elif result.get("text"):
-                        agent_text = result["text"]
-                        print(f"[Agent] {agent_text}")
-                        try:
-                            agent_audio = await text_to_speech(agent_text)
-                            await websocket.send_json({
-                                "type": "audio",
-                                "payload": base64.b64encode(agent_audio).decode("utf-8"),
-                            })
-                        except Exception as e:
-                            print(f"[TTS] Error: {e}")
-                        await websocket.send_json({
-                            "type": "transcript",
-                            "speaker": "Agent",
-                            "text": agent_text,
-                        })
-                        conv.add_to_transcript("Agent", agent_text)
-
-                    silence_count = 0
-
-                elif transcript is None:
-                    silence_count += 1
-                    if silence_count >= 3:
-                        prompt_text = (
-                            "I didn't quite catch that. Could you please say it again "
-                            "clearly and make sure your microphone is working?"
-                        )
-                        prompt_audio = await text_to_speech(prompt_text)
-                        await websocket.send_json({
-                            "type": "audio",
-                            "payload": base64.b64encode(prompt_audio).decode("utf-8"),
-                        })
-                        await websocket.send_json({
-                            "type": "transcript",
-                            "speaker": "Agent",
-                            "text": prompt_text,
-                        })
-                        conv.add_to_transcript("Agent", prompt_text)
-                        silence_count = 0
-                else:
-                    silence_count = 0
-
-                await asyncio.sleep(0.01)
-
         except Exception as e:
-            print(f"[Conv] Error: {e}")
-        finally:
-            conv.done = True
+            print(f"[TTS] Error: {e}")
+        await websocket.send_json({
+            "type": "transcript",
+            "speaker": "Agent",
+            "text": text,
+        })
 
     try:
-        await stt.connect()
-        connected = True
-
         audio_task = asyncio.create_task(receive_audio())
-        conv_task = asyncio.create_task(conversation_loop())
 
-        await conv_task
+        while not conv.done:
+            transcript = await stt.receive_transcript()
 
-        if audio_task and not audio_task.done():
-            audio_task.cancel()
-            try:
-                await audio_task
-            except asyncio.CancelledError:
-                pass
+            if transcript and transcript.get("is_final") and transcript.get("text"):
+                user_text = transcript["text"]
+                print(f"[User] {user_text}")
+                conv.add_to_transcript("Customer", user_text)
+                await websocket.send_json({
+                    "type": "transcript",
+                    "speaker": "Customer",
+                    "text": user_text,
+                })
 
-        result_msg = {
+                agent.add_user_message(user_text)
+                silence_count = 0
+
+                try:
+                    result = await agent.get_response()
+                except Exception as e:
+                    print(f"[LLM] Error: {e}")
+                    await speak("I'm sorry, I had trouble understanding. Could you repeat that?")
+                    continue
+
+                if result.get("extracted_booking"):
+                    conv.set_booking(result["extracted_booking"])
+                    summary = conv.get_booking_summary()
+                    await speak(
+                        f"Let me confirm your booking:\n\n{summary}\n\n"
+                        f"Does everything look correct? Please say 'yes' to confirm "
+                        f"or let me know what needs to change."
+                    )
+
+                elif result.get("done") and result.get("confirmed"):
+                    conv.confirmed = True
+                    await speak(
+                        f"Perfect! Your booking is confirmed. Thank you for choosing "
+                        f"{restaurant_name}. We look forward to serving you. Have a wonderful day!"
+                    )
+
+                elif result.get("text"):
+                    agent_text = result["text"]
+                    print(f"[Agent] {agent_text}")
+                    await speak(agent_text)
+
+            elif transcript is None:
+                silence_count += 1
+                if silence_count >= 15:
+                    await speak(
+                        "I didn't quite catch that. Could you please repeat what you said? "
+                        "Speak clearly into your microphone."
+                    )
+                    silence_count = 0
+            else:
+                silence_count = 0
+
+            await asyncio.sleep(0.01)
+
+        await audio_task
+
+        await websocket.send_json({
             "type": "result",
             "booking": conv.booking,
             "confirmed": conv.confirmed,
             "done": conv.done,
-        }
-        await websocket.send_json(result_msg)
+        })
 
         if conv.confirmed and conv.booking:
             from database import async_session
@@ -255,7 +212,6 @@ async def handle_call(websocket: WebSocket):
 
             from main import broadcast_booking
             await broadcast_booking(booking.to_dict())
-
             print(f"[DB] Booking saved: {booking.id}")
 
     except Exception as e:
@@ -265,14 +221,11 @@ async def handle_call(websocket: WebSocket):
         except Exception:
             pass
     finally:
-        if connected:
-            await stt.close()
+        await stt.close()
         if audio_task and not audio_task.done():
             audio_task.cancel()
-        if conv_task and not conv_task.done():
-            conv_task.cancel()
         try:
             await websocket.close()
         except Exception:
             pass
-        print("[WS] Call disconnected")
+        print(f"[WS] Call disconnected (audio chunks: {audio_count})")

@@ -8,266 +8,213 @@ interface Message {
   text: string
 }
 
-interface Props {
-  onTranscript: (messages: Message[]) => void
-  onStatusChange: (status: "idle" | "connecting" | "connected" | "ended") => void
-}
-
-export default function CallButton({ onTranscript, onStatusChange }: Props) {
+export default function CallButton({
+  onTranscript,
+  onStatusChange,
+}: {
+  onTranscript: (msgs: Message[]) => void
+  onStatusChange: (s: "idle" | "connecting" | "connected" | "ended") => void
+}) {
   const [status, setStatus] = useState<"idle" | "connecting" | "connected" | "ended">("idle")
   const [error, setError] = useState<string | null>(null)
+  const [micLevel, setMicLevel] = useState(0)
 
-  const wsRef = useRef<WebSocket | null>(null)
   const ctxRef = useRef<AudioContext | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
-  const workletRef = useRef<AudioWorkletNode | ScriptProcessorNode | null>(null)
-  const messagesRef = useRef<Message[]>([])
-  const audioQueueRef = useRef<Float32Array[]>([])
-  const playingRef = useRef(false)
-  const gainRef = useRef<GainNode | null>(null)
-  const onTranscriptRef = useRef(onTranscript)
-  const onStatusChangeRef = useRef(onStatusChange)
-  const endCallRef = useRef<() => void>(() => {})
+  const procRef = useRef<ScriptProcessorNode | null>(null)
+  const msgsRef = useRef<Message[]>([])
+  const cbRef = useRef({ onTranscript, onStatusChange })
+  cbRef.current = { onTranscript, onStatusChange }
 
-  useEffect(() => {
-    onTranscriptRef.current = onTranscript
-  }, [onTranscript])
-
-  useEffect(() => {
-    onStatusChangeRef.current = onStatusChange
-  }, [onStatusChange])
-
-  const playNext = useCallback(() => {
-    if (audioQueueRef.current.length === 0) {
-      playingRef.current = false
-      return
-    }
-    playingRef.current = true
-    const ctx = ctxRef.current
-    const gain = gainRef.current
-    if (!ctx || !gain) return
-
-    const pcmData = audioQueueRef.current.shift()!
-    const buffer = ctx.createBuffer(1, pcmData.length, 24000)
-    buffer.getChannelData(0).set(pcmData)
-    const source = ctx.createBufferSource()
-    source.buffer = buffer
-    source.connect(gain)
-    source.onended = () => playNext()
-    source.start()
-  }, [])
-
-  const cleanup = useCallback(() => {
-    if (workletRef.current) {
-      try { workletRef.current.disconnect() } catch {}
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop())
-      streamRef.current = null
-    }
-    if (ctxRef.current) {
-      ctxRef.current.close().catch(() => {})
-      ctxRef.current = null
-    }
-    if (wsRef.current) {
-      wsRef.current.close()
-      wsRef.current = null
-    }
-    audioQueueRef.current = []
-    playingRef.current = false
-    workletRef.current = null
+  const stopAll = useCallback(() => {
+    procRef.current?.disconnect()
+    procRef.current = null
+    streamRef.current?.getTracks().forEach((t) => t.stop())
+    streamRef.current = null
+    ctxRef.current?.close().catch(() => {})
+    ctxRef.current = null
+    wsRef.current?.close()
+    wsRef.current = null
+    setMicLevel(0)
   }, [])
 
   const endCall = useCallback(() => {
-    cleanup()
-    onStatusChangeRef.current("ended")
+    stopAll()
     setStatus("ended")
-  }, [cleanup])
+    cbRef.current.onStatusChange("ended")
+  }, [stopAll])
 
-  useEffect(() => {
-    endCallRef.current = endCall
-  }, [endCall])
+  const playBuffer = useCallback(async (pcm16Base64: string) => {
+    const ctx = ctxRef.current
+    if (!ctx) return
+
+    if (ctx.state === "suspended") await ctx.resume()
+
+    const raw = atob(pcm16Base64)
+    const len = raw.length
+    const i16 = new Int16Array(len / 2)
+    for (let i = 0; i < len / 2; i++) {
+      i16[i] = raw.charCodeAt(i * 2) | (raw.charCodeAt(i * 2 + 1) << 8)
+    }
+    const f32 = new Float32Array(i16.length)
+    for (let i = 0; i < i16.length; i++) {
+      f32[i] = i16[i] / 32768
+    }
+
+    const buf = ctx.createBuffer(1, f32.length, 24000)
+    buf.getChannelData(0).set(f32)
+    const src = ctx.createBufferSource()
+    src.buffer = buf
+    src.connect(ctx.destination)
+    src.start()
+  }, [])
 
   const startCall = useCallback(async () => {
     setError(null)
     setStatus("connecting")
-    onStatusChangeRef.current("connecting")
-    messagesRef.current = []
+    cbRef.current.onStatusChange("connecting")
+    msgsRef.current = []
+    setMicLevel(0)
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      })
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       streamRef.current = stream
+      console.log("[Stream] Microphone acquired", stream.getAudioTracks()[0].label)
 
-      const ctx = new AudioContext({ sampleRate: 48000 })
+      const ctx = new AudioContext()
       ctxRef.current = ctx
-      console.log(`[AudioCtx] Sample rate: ${ctx.sampleRate} Hz`)
-
-      const gain = ctx.createGain()
-      gain.gain.value = 0.8
-      gain.connect(ctx.destination)
-      gainRef.current = gain
+      console.log(`[AudioCtx] Created, state=${ctx.state}, sampleRate=${ctx.sampleRate}`)
 
       const ws = new WebSocket("ws://localhost:8000/ws/call")
       wsRef.current = ws
       ws.binaryType = "arraybuffer"
 
-      ws.onopen = () => {
-        setStatus("connected")
-        onStatusChangeRef.current("connected")
-
-        const source = ctx.createMediaStreamSource(stream)
-
-        const processor = ctx.createScriptProcessor(4096, 1, 1)
-        workletRef.current = processor
-        source.connect(processor)
-        processor.connect(ctx.destination)
-
-        let chunkCount = 0
-        processor.onaudioprocess = (e) => {
-          chunkCount++
-          if (chunkCount === 1 || chunkCount % 50 === 0) {
-            console.log(`[Mic] Sending chunk #${chunkCount}`)
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data)
+          if (msg.type === "audio" && msg.payload) {
+            playBuffer(msg.payload)
           }
-
-          const input = e.inputBuffer.getChannelData(0)
-          const output = e.outputBuffer.getChannelData(0)
-          output.fill(0)
-
-          const pcm16 = new Int16Array(input.length)
-          for (let i = 0; i < input.length; i++) {
-            const s = Math.max(-1, Math.min(1, input[i]))
-            pcm16[i] = s < 0 ? s * 32768 : s * 32767
+          if (msg.type === "transcript") {
+            console.log(`[${msg.speaker}] ${msg.text}`)
+            msgsRef.current = [...msgsRef.current, { speaker: msg.speaker, text: msg.text }]
+            cbRef.current.onTranscript([...msgsRef.current])
           }
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(pcm16.buffer)
-          }
+          if (msg.type === "error") setError(msg.message)
+        } catch {}
+      }
+      ws.onclose = () => endCall()
+      ws.onerror = () => {
+        setError("Connection failed. Is the backend running on port 8000?")
+        endCall()
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ type: "init", sampleRate: ctx.sampleRate }))
+          console.log("[WS] Connected, sent init")
+          resolve()
+        }
+        setTimeout(() => reject(new Error("WebSocket timeout")), 5000)
+      })
+
+      if (ctx.state === "suspended") {
+        console.log("[AudioCtx] Resuming...")
+        await ctx.resume()
+        console.log(`[AudioCtx] State now: ${ctx.state}`)
+      }
+
+      const source = ctx.createMediaStreamSource(stream)
+      const proc = ctx.createScriptProcessor(4096, 1, 1)
+      procRef.current = proc
+      source.connect(proc)
+      proc.connect(ctx.destination)
+
+      let n = 0
+      let maxVal = 0
+      proc.onaudioprocess = (ev) => {
+        n++
+        const input = ev.inputBuffer.getChannelData(0)
+        let peak = 0
+        for (let i = 0; i < input.length; i++) {
+          const v = Math.abs(input[i])
+          if (v > peak) peak = v
+        }
+        if (peak > maxVal) maxVal = peak
+
+        if (n === 1 || n % 100 === 0) {
+          console.log(`[Mic] Chunk #${n}, peak=${peak.toFixed(3)}, max=${maxVal.toFixed(3)}`)
+        }
+
+        const output = ev.outputBuffer.getChannelData(0)
+        output.fill(0)
+
+        const i16 = new Int16Array(input.length)
+        for (let i = 0; i < input.length; i++) {
+          const s = Math.max(-1, Math.min(1, input[i]))
+          i16[i] = s < 0 ? s * 32768 : s * 32767
+        }
+
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(new Uint8Array(i16.buffer))
         }
       }
 
-      ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data)
-
-          if (msg.type === "audio" && msg.payload) {
-            console.log("[Agent] Received audio")
-            const binary = atob(msg.payload)
-            const len = binary.length
-            const pcm16 = new Int16Array(len / 2)
-            for (let i = 0; i < len / 2; i++) {
-              pcm16[i] = binary.charCodeAt(i * 2) | (binary.charCodeAt(i * 2 + 1) << 8)
-            }
-            const float32 = new Float32Array(pcm16.length)
-            for (let i = 0; i < pcm16.length; i++) {
-              float32[i] = pcm16[i] / 32768.0
-            }
-            audioQueueRef.current.push(float32)
-            if (!playingRef.current) {
-              playNext()
-            }
-          }
-
-          if (msg.type === "transcript") {
-            console.log(`[${msg.speaker}] ${msg.text}`)
-            messagesRef.current = [
-              ...messagesRef.current,
-              { speaker: msg.speaker, text: msg.text },
-            ]
-            onTranscriptRef.current([...messagesRef.current])
-          }
-
-          if (msg.type === "result" && msg.done) {
-            setTimeout(() => endCallRef.current(), 3000)
-          }
-
-          if (msg.type === "error") {
-            setError(msg.message)
-          }
-        } catch {}
-      }
-
-      ws.onclose = () => {
-        setStatus("ended")
-        onStatusChangeRef.current("ended")
-        cleanup()
-      }
-
-      ws.onerror = () => {
-        setError("Connection failed. Is the backend running on port 8000?")
-        endCallRef.current()
-      }
+      setStatus("connected")
+      cbRef.current.onStatusChange("connected")
+      console.log("[Call] Ready - start speaking")
     } catch (err: any) {
-      if (err.name === "NotAllowedError") {
-        setError("Microphone access denied. Please allow mic permissions.")
-      } else {
-        setError(err.message || "Failed to start call")
-      }
-      endCallRef.current()
+      console.error("[Call] Error:", err)
+      setError(err.message || "Failed to start")
+      endCall()
     }
-  }, [playNext, cleanup])
+  }, [endCall, playBuffer])
 
-  useEffect(() => {
-    return () => {
-      cleanup()
-    }
-  }, [cleanup])
+  useEffect(() => () => stopAll(), [stopAll])
+
+  const btn = (label: string, icon: React.ReactNode, cls: string, onClick: () => void) => (
+    <button
+      onClick={onClick}
+      className={`flex items-center gap-3 px-8 py-4 rounded-full text-lg font-semibold transition-all hover:scale-105 active:scale-95 shadow-lg ${cls}`}
+    >
+      {icon}
+      {label}
+    </button>
+  )
 
   return (
     <div className="flex flex-col items-center gap-4">
       {error && (
-        <div className="text-red-400 text-sm bg-red-900/20 rounded-lg px-4 py-2 max-w-md text-center">
-          {error}
-        </div>
+        <div className="text-red-400 text-sm bg-red-900/20 rounded-lg px-4 py-2 text-center max-w-md">{error}</div>
       )}
-
-      {status === "idle" && (
-        <button
-          onClick={startCall}
-          className="flex items-center gap-3 px-8 py-4 bg-green-600 hover:bg-green-700 text-white rounded-full text-lg font-semibold transition-all hover:scale-105 active:scale-95 shadow-lg shadow-green-600/25"
-        >
-          <Phone className="w-5 h-5" />
-          Call Now
-        </button>
-      )}
-
+      {status === "idle" &&
+        btn("Call Now", <Phone className="w-5 h-5" />, "bg-green-600 hover:bg-green-700 text-white shadow-green-600/25", startCall)}
       {status === "connecting" && (
         <div className="flex items-center gap-3 px-8 py-4 bg-yellow-600/80 text-white rounded-full text-lg font-semibold">
-          <Loader2 className="w-5 h-5 animate-spin" />
-          Connecting...
+          <Loader2 className="w-5 h-5 animate-spin" /> Connecting...
         </div>
       )}
-
       {status === "connected" && (
-        <button
-          onClick={() => endCallRef.current()}
-          className="flex items-center gap-3 px-8 py-4 bg-red-600 hover:bg-red-700 text-white rounded-full text-lg font-semibold transition-all hover:scale-105 active:scale-95 shadow-lg shadow-red-600/25"
-        >
-          <PhoneOff className="w-5 h-5" />
-          End Call
-        </button>
+        <>
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-green-400">Microphone level:</span>
+            <div className="w-32 h-2 bg-gray-700 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-green-400 transition-all duration-100 rounded-full"
+                style={{ width: `${micLevel}%` }}
+              />
+            </div>
+          </div>
+          {btn("End Call", <PhoneOff className="w-5 h-5" />, "bg-red-600 hover:bg-red-700 text-white shadow-red-600/25", endCall)}
+          <p className="text-green-400 text-sm flex items-center gap-2">
+            <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
+            Call in progress — speak now
+          </p>
+        </>
       )}
-
-      {status === "ended" && (
-        <button
-          onClick={startCall}
-          className="flex items-center gap-3 px-8 py-4 bg-green-600 hover:bg-green-700 text-white rounded-full text-lg font-semibold transition-all hover:scale-105 active:scale-95 shadow-lg shadow-green-600/25"
-        >
-          <Phone className="w-5 h-5" />
-          Call Again
-        </button>
-      )}
-
-      {status === "connected" && (
-        <p className="text-green-400 text-sm flex items-center gap-2">
-          <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
-          Call in progress
-        </p>
-      )}
+      {status === "ended" &&
+        btn("Call Again", <Phone className="w-5 h-5" />, "bg-green-600 hover:bg-green-700 text-white shadow-green-600/25", startCall)}
     </div>
   )
 }

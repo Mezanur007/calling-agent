@@ -11,11 +11,12 @@ load_dotenv()
 
 
 class DeepgramSTT:
-    def __init__(self):
+    def __init__(self, sample_rate: int = 48000):
         api_key = os.getenv("DEEPGRAM_API_KEY")
         if not api_key:
-            raise ValueError("DEEPGRAM_API_KEY not set in environment")
+            raise ValueError("DEEPGRAM_API_KEY not set")
         self.client = DeepgramClient(api_key)
+        self.sample_rate = sample_rate
         self.transcript_queue: asyncio.Queue = asyncio.Queue()
         self._connection = None
         self._keepalive_task = None
@@ -27,15 +28,16 @@ class DeepgramSTT:
             if not channel or not channel.alternatives:
                 return
             sentence = channel.alternatives[0].transcript
-            if sentence:
-                is_final = result.speech_final if hasattr(result, "speech_final") else True
-                print(f"[Deepgram] Transcript{' (final)' if is_final else ''}: {sentence}")
-                self.transcript_queue.put_nowait({"text": sentence.strip(), "is_final": is_final})
+            if not sentence:
+                return
+            is_final = result.speech_final if hasattr(result, "speech_final") else True
+            print(f"[Deepgram] {'FINAL' if is_final else 'interim'}: {sentence}")
+            self.transcript_queue.put_nowait({"text": sentence.strip(), "is_final": is_final})
         except Exception as e:
-            print(f"[Deepgram] Transcript parse error: {e}")
+            print(f"[Deepgram] Parse error: {e}")
 
     def _on_error(self, error, **kwargs):
-        print(f"[Deepgram] Error: {error}")
+        print(f"[Deepgram] ERROR: {error}")
 
     def _on_close(self, *args, **kwargs):
         print("[Deepgram] Connection closed")
@@ -49,8 +51,8 @@ class DeepgramSTT:
             try:
                 if self._connection:
                     self._connection.keep_alive()
-            except Exception as e:
-                print(f"[Deepgram] Keepalive error: {e}")
+            except Exception:
+                pass
             await asyncio.sleep(5)
 
     async def connect(self):
@@ -68,21 +70,18 @@ class DeepgramSTT:
             interim_results=True,
             utterance_end_ms=1000,
             encoding="linear16",
-            sample_rate=48000,
+            sample_rate=self.sample_rate,
             channels=1,
             endpointing=300,
         )
         started = self._connection.start(options)
-        print(f"[Deepgram] Start result: {started}")
+        print(f"[Deepgram] Start result: {started}, rate: {self.sample_rate}")
         self._keepalive_task = asyncio.create_task(self._keepalive())
         return started
 
-    async def send_audio(self, audio_bytes: bytes):
+    def send_audio(self, audio_bytes: bytes):
         if self._connection and self._running:
-            try:
-                self._connection.send(audio_bytes)
-            except Exception as e:
-                print(f"[Deepgram] Send error: {e}")
+            self._connection.send(audio_bytes)
 
     async def receive_transcript(self):
         try:
@@ -94,12 +93,8 @@ class DeepgramSTT:
         self._running = False
         if self._keepalive_task:
             self._keepalive_task.cancel()
-            try:
-                await self._keepalive_task
-            except asyncio.CancelledError:
-                pass
         if self._connection:
             try:
                 self._connection.finish()
-            except Exception as e:
-                print(f"[Deepgram] Close error: {e}")
+            except Exception:
+                pass
