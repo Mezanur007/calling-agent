@@ -1,0 +1,53 @@
+restaurant:
+  name: "La Dolce Vita"
+  cuisine: "Italian"
+  address: "123 Main St, Downtown"
+  phone: "(555) 123-4567"
+  hours:
+    monday: "11:00-22:00"
+    tuesday: "11:00-22:00"
+    wednesday: "11:00-22:00"
+    thursday: "11:00-22:00"
+    friday: "11:00-23:00"
+    saturday: "10:00-23:00"
+    sunday: "10:00-21:00"
+  menu:
+    - name: "Margherita Pizza"
+      category: "mains"
+      price: 12.99
+      description: "Classic tomato, mozzarella, and fresh basil"
+    - name: "Pasta Carbonara"
+      category: "mains"
+      price: 14.99
+      description: "Creamy egg sauce with pancetta and parmesan"
+    - name: "Caesar Salad"
+      category: "starters"
+      price: 9.99
+      description: "Romaine lettuce, croutons, parmesan, Caesar dressing"
+    - name: "Bruschetta"
+      category: "starters"
+      price: 8.49
+      description: "Toasted bread with tomato, basil, and garlic"
+    - name: "Tiramisu"
+      category: "desserts"
+      price: 7.99
+      description: "Classic Italian coffee-flavored layered dessert"
+    - name: "Panna Cotta"
+      category: "desserts"
+      price: 6.99
+      description: "Creamy vanilla dessert with berry compote"
+    - name: "Espresso"
+      category: "drinks"
+      price: 3.49
+      description: "Rich Italian espresso shot"
+    - name: "Aperol Spritz"
+      category: "drinks"
+      price: 10.99
+      description: "Classic Italian aperitif cocktail"
+    - name: "Mineral Water"
+      category: "drinks"
+      price: 2.99
+      description: "Sparkling or still"
+  booking:
+    max_guests_per_table: 10
+    slot_duration_minutes: 90
