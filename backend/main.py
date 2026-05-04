@@ -1,9 +1,11 @@
 import os
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from database import init_db, get_db
@@ -12,7 +14,18 @@ from ws_handler import handle_call
 from dotenv import load_dotenv
 
 load_dotenv()
-app = FastAPI(title="Calling Agent")
+
+sse_clients: list[asyncio.Queue] = []
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    print("[App] Database initialized")
+    yield
+
+
+app = FastAPI(title="Calling Agent", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,14 +34,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-sse_clients: list[asyncio.Queue] = []
-
-
-@app.on_event("startup")
-async def startup():
-    await init_db()
-    print("[App] Database initialized")
 
 
 @app.websocket("/ws/call")
@@ -58,7 +63,6 @@ async def bookings_sse():
             if queue in sse_clients:
                 sse_clients.remove(queue)
 
-    from fastapi.responses import StreamingResponse
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
@@ -76,4 +80,5 @@ async def broadcast_booking(booking_dict: dict):
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

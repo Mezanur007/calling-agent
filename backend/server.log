@@ -1,0 +1,2 @@
+[App] Database initialized
+INFO:     127.0.0.1:3361 - "GET /api/bookings HTTP/1.1" 200 OK

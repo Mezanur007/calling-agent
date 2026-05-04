@@ -1,6 +1,7 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 websockets==14.1
+greenlet==3.5.0
 openai==1.58.1
 deepgram-sdk==3.11.0
 sqlalchemy==2.0.36
