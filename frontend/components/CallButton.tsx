@@ -1,8 +1,7 @@
 "use client"
 
 import { useState, useRef, useEffect, useCallback } from "react"
-import { Phone, PhoneOff, Mic, MicOff, Loader2 } from "lucide-react"
-import { cn } from "@/lib/utils"
+import { Phone, PhoneOff, Loader2 } from "lucide-react"
 
 interface Message {
   speaker: "Agent" | "Customer"
@@ -17,33 +16,35 @@ interface Props {
 export default function CallButton({ onTranscript, onStatusChange }: Props) {
   const [status, setStatus] = useState<"idle" | "connecting" | "connected" | "ended">("idle")
   const [error, setError] = useState<string | null>(null)
+
   const wsRef = useRef<WebSocket | null>(null)
-  const audioContextRef = useRef<AudioContext | null>(null)
+  const ctxRef = useRef<AudioContext | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
-  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
-  const processorRef = useRef<ScriptProcessorNode | null>(null)
+  const workletRef = useRef<AudioWorkletNode | ScriptProcessorNode | null>(null)
   const messagesRef = useRef<Message[]>([])
-  const analyserRef = useRef<AnalyserNode | null>(null)
   const audioQueueRef = useRef<Float32Array[]>([])
   const playingRef = useRef(false)
-  const gainNodeRef = useRef<GainNode | null>(null)
+  const gainRef = useRef<GainNode | null>(null)
+  const onTranscriptRef = useRef(onTranscript)
+  const onStatusChangeRef = useRef(onStatusChange)
+  const endCallRef = useRef<() => void>(() => {})
 
-  const updateStatus = useCallback(
-    (s: "idle" | "connecting" | "connected" | "ended") => {
-      setStatus(s)
-      onStatusChange(s)
-    },
-    [onStatusChange]
-  )
+  useEffect(() => {
+    onTranscriptRef.current = onTranscript
+  }, [onTranscript])
 
-  const playNextAudio = useCallback(() => {
+  useEffect(() => {
+    onStatusChangeRef.current = onStatusChange
+  }, [onStatusChange])
+
+  const playNext = useCallback(() => {
     if (audioQueueRef.current.length === 0) {
       playingRef.current = false
       return
     }
     playingRef.current = true
-    const ctx = audioContextRef.current
-    const gain = gainNodeRef.current
+    const ctx = ctxRef.current
+    const gain = gainRef.current
     if (!ctx || !gain) return
 
     const pcmData = audioQueueRef.current.shift()!
@@ -52,13 +53,45 @@ export default function CallButton({ onTranscript, onStatusChange }: Props) {
     const source = ctx.createBufferSource()
     source.buffer = buffer
     source.connect(gain)
-    source.onended = () => playNextAudio()
+    source.onended = () => playNext()
     source.start()
   }, [])
 
+  const cleanup = useCallback(() => {
+    if (workletRef.current) {
+      try { workletRef.current.disconnect() } catch {}
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop())
+      streamRef.current = null
+    }
+    if (ctxRef.current) {
+      ctxRef.current.close().catch(() => {})
+      ctxRef.current = null
+    }
+    if (wsRef.current) {
+      wsRef.current.close()
+      wsRef.current = null
+    }
+    audioQueueRef.current = []
+    playingRef.current = false
+    workletRef.current = null
+  }, [])
+
+  const endCall = useCallback(() => {
+    cleanup()
+    onStatusChangeRef.current("ended")
+    setStatus("ended")
+  }, [cleanup])
+
+  useEffect(() => {
+    endCallRef.current = endCall
+  }, [endCall])
+
   const startCall = useCallback(async () => {
     setError(null)
-    updateStatus("connecting")
+    setStatus("connecting")
+    onStatusChangeRef.current("connecting")
     messagesRef.current = []
 
     try {
@@ -68,34 +101,31 @@ export default function CallButton({ onTranscript, onStatusChange }: Props) {
           sampleRate: 16000,
           echoCancellation: true,
           noiseSuppression: true,
+          autoGainControl: true,
         },
       })
       streamRef.current = stream
 
       const ctx = new AudioContext({ sampleRate: 24000 })
-      audioContextRef.current = ctx
-
-      const analyser = ctx.createAnalyser()
-      analyser.fftSize = 128
-      analyserRef.current = analyser
+      ctxRef.current = ctx
 
       const gain = ctx.createGain()
       gain.gain.value = 0.8
-      gainNodeRef.current = gain
       gain.connect(ctx.destination)
+      gainRef.current = gain
 
       const ws = new WebSocket("ws://localhost:8000/ws/call")
       wsRef.current = ws
+      ws.binaryType = "arraybuffer"
 
       ws.onopen = () => {
-        updateStatus("connected")
+        setStatus("connected")
+        onStatusChangeRef.current("connected")
 
         const source = ctx.createMediaStreamSource(stream)
-        sourceRef.current = source
-        source.connect(analyser)
 
         const processor = ctx.createScriptProcessor(4096, 1, 1)
-        processorRef.current = processor
+        workletRef.current = processor
         source.connect(processor)
         processor.connect(ctx.destination)
 
@@ -103,7 +133,8 @@ export default function CallButton({ onTranscript, onStatusChange }: Props) {
           const input = e.inputBuffer.getChannelData(0)
           const pcm16 = new Int16Array(input.length)
           for (let i = 0; i < input.length; i++) {
-            pcm16[i] = Math.max(-32768, Math.min(32767, Math.round(input[i] * 32767)))
+            const s = Math.max(-1, Math.min(1, input[i]))
+            pcm16[i] = s < 0 ? s * 32768 : s * 32767
           }
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(pcm16.buffer)
@@ -117,8 +148,9 @@ export default function CallButton({ onTranscript, onStatusChange }: Props) {
 
           if (msg.type === "audio" && msg.payload) {
             const binary = atob(msg.payload)
-            const pcm16 = new Int16Array(binary.length / 2)
-            for (let i = 0; i < pcm16.length; i++) {
+            const len = binary.length
+            const pcm16 = new Int16Array(len / 2)
+            for (let i = 0; i < len / 2; i++) {
               pcm16[i] = binary.charCodeAt(i * 2) | (binary.charCodeAt(i * 2 + 1) << 8)
             }
             const float32 = new Float32Array(pcm16.length)
@@ -127,20 +159,20 @@ export default function CallButton({ onTranscript, onStatusChange }: Props) {
             }
             audioQueueRef.current.push(float32)
             if (!playingRef.current) {
-              playNextAudio()
+              playNext()
             }
           }
 
           if (msg.type === "transcript") {
-            messagesRef.current.push({
-              speaker: msg.speaker,
-              text: msg.text,
-            })
-            onTranscript([...messagesRef.current])
+            messagesRef.current = [
+              ...messagesRef.current,
+              { speaker: msg.speaker, text: msg.text },
+            ]
+            onTranscriptRef.current([...messagesRef.current])
           }
 
           if (msg.type === "result" && msg.done) {
-            setTimeout(() => endCall(), 3000)
+            setTimeout(() => endCallRef.current(), 3000)
           }
 
           if (msg.type === "error") {
@@ -150,50 +182,35 @@ export default function CallButton({ onTranscript, onStatusChange }: Props) {
       }
 
       ws.onclose = () => {
-        updateStatus("ended")
+        setStatus("ended")
+        onStatusChangeRef.current("ended")
+        cleanup()
       }
 
       ws.onerror = () => {
-        setError("Connection failed. Is the server running?")
-        updateStatus("ended")
+        setError("Connection failed. Is the backend running on port 8000?")
+        endCallRef.current()
       }
     } catch (err: any) {
-      setError(err.message || "Microphone access denied")
-      updateStatus("ended")
+      if (err.name === "NotAllowedError") {
+        setError("Microphone access denied. Please allow mic permissions.")
+      } else {
+        setError(err.message || "Failed to start call")
+      }
+      endCallRef.current()
     }
-  }, [])
-
-  const endCall = useCallback(() => {
-    if (processorRef.current) {
-      processorRef.current.disconnect()
-    }
-    if (sourceRef.current) {
-      sourceRef.current.disconnect()
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop())
-    }
-    if (audioContextRef.current) {
-      audioContextRef.current.close().catch(() => {})
-    }
-    if (wsRef.current) {
-      wsRef.current.close()
-    }
-    audioQueueRef.current = []
-    playingRef.current = false
-    updateStatus("ended")
-  }, [updateStatus])
+  }, [playNext, cleanup])
 
   useEffect(() => {
     return () => {
-      endCall()
+      cleanup()
     }
-  }, [endCall])
+  }, [cleanup])
 
   return (
     <div className="flex flex-col items-center gap-4">
       {error && (
-        <div className="text-red-400 text-sm bg-red-900/20 rounded-lg px-4 py-2">
+        <div className="text-red-400 text-sm bg-red-900/20 rounded-lg px-4 py-2 max-w-md text-center">
           {error}
         </div>
       )}
@@ -209,7 +226,7 @@ export default function CallButton({ onTranscript, onStatusChange }: Props) {
       )}
 
       {status === "connecting" && (
-        <div className="flex items-center gap-3 px-8 py-4 bg-yellow-600 text-white rounded-full text-lg font-semibold">
+        <div className="flex items-center gap-3 px-8 py-4 bg-yellow-600/80 text-white rounded-full text-lg font-semibold">
           <Loader2 className="w-5 h-5 animate-spin" />
           Connecting...
         </div>
@@ -217,7 +234,7 @@ export default function CallButton({ onTranscript, onStatusChange }: Props) {
 
       {status === "connected" && (
         <button
-          onClick={endCall}
+          onClick={() => endCallRef.current()}
           className="flex items-center gap-3 px-8 py-4 bg-red-600 hover:bg-red-700 text-white rounded-full text-lg font-semibold transition-all hover:scale-105 active:scale-95 shadow-lg shadow-red-600/25"
         >
           <PhoneOff className="w-5 h-5" />
