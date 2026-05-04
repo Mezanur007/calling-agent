@@ -97,8 +97,6 @@ export default function CallButton({ onTranscript, onStatusChange }: Props) {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          channelCount: 1,
-          sampleRate: 16000,
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
@@ -106,8 +104,9 @@ export default function CallButton({ onTranscript, onStatusChange }: Props) {
       })
       streamRef.current = stream
 
-      const ctx = new AudioContext({ sampleRate: 16000 })
+      const ctx = new AudioContext({ sampleRate: 48000 })
       ctxRef.current = ctx
+      console.log(`[AudioCtx] Sample rate: ${ctx.sampleRate} Hz`)
 
       const gain = ctx.createGain()
       gain.gain.value = 0.8
@@ -127,14 +126,19 @@ export default function CallButton({ onTranscript, onStatusChange }: Props) {
         const processor = ctx.createScriptProcessor(4096, 1, 1)
         workletRef.current = processor
         source.connect(processor)
+        processor.connect(ctx.destination)
 
-        const silentGain = ctx.createGain()
-        silentGain.gain.value = 0
-        processor.connect(silentGain)
-        silentGain.connect(ctx.destination)
-
+        let chunkCount = 0
         processor.onaudioprocess = (e) => {
+          chunkCount++
+          if (chunkCount === 1 || chunkCount % 50 === 0) {
+            console.log(`[Mic] Sending chunk #${chunkCount}`)
+          }
+
           const input = e.inputBuffer.getChannelData(0)
+          const output = e.outputBuffer.getChannelData(0)
+          output.fill(0)
+
           const pcm16 = new Int16Array(input.length)
           for (let i = 0; i < input.length; i++) {
             const s = Math.max(-1, Math.min(1, input[i]))
@@ -151,6 +155,7 @@ export default function CallButton({ onTranscript, onStatusChange }: Props) {
           const msg = JSON.parse(event.data)
 
           if (msg.type === "audio" && msg.payload) {
+            console.log("[Agent] Received audio")
             const binary = atob(msg.payload)
             const len = binary.length
             const pcm16 = new Int16Array(len / 2)
@@ -168,6 +173,7 @@ export default function CallButton({ onTranscript, onStatusChange }: Props) {
           }
 
           if (msg.type === "transcript") {
+            console.log(`[${msg.speaker}] ${msg.text}`)
             messagesRef.current = [
               ...messagesRef.current,
               { speaker: msg.speaker, text: msg.text },

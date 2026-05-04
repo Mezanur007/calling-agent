@@ -68,7 +68,7 @@ class DeepgramSTT:
             interim_results=True,
             utterance_end_ms=1000,
             encoding="linear16",
-            sample_rate=16000,
+            sample_rate=48000,
             channels=1,
             endpointing=300,
         )

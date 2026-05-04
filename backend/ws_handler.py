@@ -24,23 +24,27 @@ async def handle_call(websocket: WebSocket):
     conv_task = None
 
     audio_count = 0
+    audio_bytes_total = 0
     async def receive_audio():
-        nonlocal audio_count
+        nonlocal audio_count, audio_bytes_total
         while True:
             try:
                 data = await websocket.receive()
                 if "bytes" in data:
                     audio_count += 1
-                    if audio_count % 50 == 0:
-                        print(f"[Audio] Received {audio_count} chunks "
-                              f"({len(data['bytes'])} bytes each)")
+                    audio_bytes_total += len(data["bytes"])
+                    if audio_count == 1:
+                        print(f"[Audio] First audio chunk received: {len(data['bytes'])} bytes")
+                    if audio_count % 100 == 0:
+                        print(f"[Audio] Received {audio_count} chunks ({audio_bytes_total} bytes total)")
                     await stt.send_audio(data["bytes"])
                 elif "text" in data:
                     msg = json.loads(data["text"])
                     if msg.get("type") == "end":
                         conv.done = True
                         break
-            except Exception:
+            except Exception as e:
+                print(f"[Audio] Receive error: {e}")
                 break
 
     async def conversation_loop():
