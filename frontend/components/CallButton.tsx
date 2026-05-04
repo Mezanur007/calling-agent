@@ -1,7 +1,7 @@
 "use client"
 
 import { useState, useRef, useEffect, useCallback } from "react"
-import { Phone, PhoneOff, Loader2 } from "lucide-react"
+import { Phone, PhoneOff, Loader2, Send } from "lucide-react"
 
 interface Message {
   speaker: "Agent" | "Customer"
@@ -18,6 +18,7 @@ export default function CallButton({
   const [status, setStatus] = useState<"idle" | "connecting" | "connected" | "ended">("idle")
   const [error, setError] = useState<string | null>(null)
   const [micLevel, setMicLevel] = useState(0)
+  const [textInput, setTextInput] = useState("")
 
   const ctxRef = useRef<AudioContext | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
@@ -171,6 +172,15 @@ export default function CallButton({
     }
   }, [endCall, playBuffer])
 
+  const sendText = useCallback(() => {
+    const text = textInput.trim()
+    if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
+    wsRef.current.send(JSON.stringify({ type: "user_text", text }))
+    msgsRef.current = [...msgsRef.current, { speaker: "Customer", text }]
+    cbRef.current.onTranscript([...msgsRef.current])
+    setTextInput("")
+  }, [textInput])
+
   useEffect(() => () => stopAll(), [stopAll])
 
   const btn = (label: string, icon: React.ReactNode, cls: string, onClick: () => void) => (
@@ -209,8 +219,25 @@ export default function CallButton({
           {btn("End Call", <PhoneOff className="w-5 h-5" />, "bg-red-600 hover:bg-red-700 text-white shadow-red-600/25", endCall)}
           <p className="text-green-400 text-sm flex items-center gap-2">
             <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
-            Call in progress — speak now
+            Call in progress — speak now or type below
           </p>
+          <form
+            onSubmit={(e) => { e.preventDefault(); sendText() }}
+            className="flex gap-2 w-full max-w-md"
+          >
+            <input
+              value={textInput}
+              onChange={(e) => setTextInput(e.target.value)}
+              placeholder="Type your message..."
+              className="flex-1 px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:border-green-500"
+            />
+            <button
+              type="submit"
+              className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition-colors"
+            >
+              <Send className="w-4 h-4" />
+            </button>
+          </form>
         </>
       )}
       {status === "ended" &&
