@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect, useCallback } from "react"
 import { Phone, PhoneOff, Loader2, Send } from "lucide-react"
 import { realtimeCallUrl } from "@/lib/api"
+import { CALL_DURATION_SECONDS, CALL_WARNING_SECONDS } from "@/lib/callLimits"
 
 interface Message {
   speaker: "Agent" | "Customer"
@@ -37,6 +38,8 @@ export default function CallButton({
   const [error, setError] = useState<string | null>(null)
   const [micLevel, setMicLevel] = useState(0)
   const [textInput, setTextInput] = useState("")
+  const [timeLeft, setTimeLeft] = useState(CALL_DURATION_SECONDS)
+  const [isClosing, setIsClosing] = useState(false)
 
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const dcRef = useRef<RTCDataChannel | null>(null)
@@ -44,6 +47,8 @@ export default function CallButton({
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null)
   const analyserCtxRef = useRef<AudioContext | null>(null)
   const analyserFrameRef = useRef<number | null>(null)
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const warningSentRef = useRef(false)
   const msgsRef = useRef<Message[]>([])
   const customerDraftsRef = useRef<Map<string, string>>(new Map())
   const agentDraftsRef = useRef<Map<string, string>>(new Map())
@@ -58,6 +63,14 @@ export default function CallButton({
   const setCallStatus = useCallback((nextStatus: CallStatus) => {
     setStatus(nextStatus)
     cbRef.current.onStatusChange(nextStatus)
+  }, [])
+
+  const clearCallTimer = useCallback(() => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current)
+      timerRef.current = null
+    }
+    warningSentRef.current = false
   }, [])
 
   const publishMessages = useCallback(() => {
@@ -117,6 +130,7 @@ export default function CallButton({
   }, [])
 
   const stopAll = useCallback(() => {
+    clearCallTimer()
     stopMicMeter()
     dcRef.current?.close()
     dcRef.current = null
@@ -128,12 +142,68 @@ export default function CallButton({
       remoteAudioRef.current.pause()
       remoteAudioRef.current.srcObject = null
     }
-  }, [stopMicMeter])
+    setIsClosing(false)
+    setTimeLeft(CALL_DURATION_SECONDS)
+  }, [clearCallTimer, stopMicMeter])
 
   const endCall = useCallback(() => {
     stopAll()
     setCallStatus("ended")
   }, [setCallStatus, stopAll])
+
+  const sendClosingWarning = useCallback(() => {
+    const dc = dcRef.current
+    if (!dc || dc.readyState !== "open") return
+
+    dc.send(JSON.stringify({ type: "response.cancel" }))
+    dc.send(JSON.stringify({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content: [{
+          type: "input_text",
+          text: "The two-minute demo call limit has finished. Say exactly: Sorry, the time has finished. Please call back again.",
+        }],
+      },
+    }))
+    dc.send(JSON.stringify({
+      type: "response.create",
+      response: {
+        instructions: "Say exactly: Sorry, the time has finished. Please call back again. Do not add anything else.",
+      },
+    }))
+  }, [])
+
+  const startCallTimer = useCallback(() => {
+    clearCallTimer()
+    setTimeLeft(CALL_DURATION_SECONDS)
+    setIsClosing(false)
+
+    timerRef.current = setInterval(() => {
+      setTimeLeft((current) => {
+        const next = Math.max(current - 1, 0)
+
+        if (next <= CALL_WARNING_SECONDS && !warningSentRef.current) {
+          warningSentRef.current = true
+          setIsClosing(true)
+          sendClosingWarning()
+        }
+
+        if (next === 0) {
+          setTimeout(() => endCall(), 0)
+        }
+
+        return next
+      })
+    }, 1000)
+  }, [clearCallTimer, endCall, sendClosingWarning])
+
+  const formatTimeLeft = useCallback((seconds: number) => {
+    const minutes = Math.floor(seconds / 60)
+    const remainingSeconds = seconds % 60
+    return `${minutes}:${remainingSeconds.toString().padStart(2, "0")}`
+  }, [])
 
   const startMicMeter = useCallback((stream: MediaStream) => {
     stopMicMeter()
@@ -247,6 +317,7 @@ export default function CallButton({
 
       dc.onopen = () => {
         setCallStatus("connected")
+        startCallTimer()
         dc.send(JSON.stringify({
           type: "response.create",
           response: {
@@ -284,12 +355,12 @@ export default function CallButton({
       setError(err instanceof Error ? err.message : "Failed to start realtime voice")
       endCall()
     }
-  }, [endCall, handleRealtimeEvent, publishMessages, setCallStatus, startMicMeter])
+  }, [endCall, handleRealtimeEvent, publishMessages, setCallStatus, startCallTimer, startMicMeter])
 
   const sendText = useCallback(() => {
     const text = textInput.trim()
     const dc = dcRef.current
-    if (!text || !dc || dc.readyState !== "open") return
+    if (!text || isClosing || !dc || dc.readyState !== "open") return
 
     dc.send(JSON.stringify({
       type: "conversation.item.create",
@@ -303,7 +374,7 @@ export default function CallButton({
 
     appendMessage("Customer", text)
     setTextInput("")
-  }, [appendMessage, textInput])
+  }, [appendMessage, isClosing, textInput])
 
   useEffect(() => () => stopAll(), [stopAll])
 
@@ -340,6 +411,11 @@ export default function CallButton({
               />
             </div>
           </div>
+          <div
+            className={`text-sm font-semibold ${timeLeft <= CALL_WARNING_SECONDS ? "text-red-300" : "text-gray-300"}`}
+          >
+            Time left: {formatTimeLeft(timeLeft)}
+          </div>
           <button
             onClick={endCall}
             className="flex items-center gap-3 px-8 py-4 rounded-full text-lg font-semibold transition-all hover:scale-105 active:scale-95 shadow-lg bg-red-600 hover:bg-red-700 text-white shadow-red-600/25"
@@ -349,7 +425,7 @@ export default function CallButton({
           </button>
           <p className="text-green-400 text-sm flex items-center gap-2">
             <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
-            Realtime call active — speak naturally
+            {isClosing ? "Call is ending..." : "Realtime call active — speak naturally"}
           </p>
           <form
             onSubmit={(event) => {
@@ -361,12 +437,14 @@ export default function CallButton({
             <input
               value={textInput}
               onChange={(event) => setTextInput(event.target.value)}
-              placeholder="Type your message..."
+              disabled={isClosing}
+              placeholder={isClosing ? "Call is ending..." : "Type your message..."}
               className="flex-1 px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:border-green-500"
             />
             <button
               type="submit"
-              className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition-colors"
+              disabled={isClosing}
+              className="px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-700 disabled:text-gray-400 text-white rounded-lg transition-colors"
             >
               <Send className="w-4 h-4" />
             </button>

@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import CallButton from "@/components/CallButton"
 import AudioVisualizer from "@/components/AudioVisualizer"
 import { Phone } from "lucide-react"
@@ -13,6 +13,17 @@ interface Message {
 export default function CallPage() {
   const [messages, setMessages] = useState<Message[]>([])
   const [status, setStatus] = useState<"idle" | "connecting" | "connected" | "ended">("idle")
+  const transcriptRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    const transcript = transcriptRef.current
+    if (!transcript) return
+
+    transcript.scrollTo({
+      top: transcript.scrollHeight,
+      behavior: status === "connected" ? "smooth" : "auto",
+    })
+  }, [messages, status])
 
   return (
     <div className="flex flex-col items-center justify-center min-h-[calc(100vh-73px)] p-6">
@@ -41,7 +52,10 @@ export default function CallPage() {
         />
 
         {messages.length > 0 && (
-          <div className="space-y-3 max-h-80 overflow-y-auto">
+          <div
+            ref={transcriptRef}
+            className="space-y-3 max-h-80 overflow-y-auto scroll-smooth"
+          >
             {messages.map((msg, i) => (
               <div
                 key={i}

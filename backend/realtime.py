@@ -13,6 +13,8 @@ load_dotenv()
 def _session_instructions() -> str:
     config = get_config()
     restaurant = config["restaurant"]
+    call_duration = int(os.getenv("CALL_DURATION_SECONDS", "120"))
+    warning_seconds = int(os.getenv("CALL_WARNING_SECONDS", "5"))
     menu = "\n".join(
         f"- {item['name']} (${item['price']:.2f}): {item['description']}"
         for item in restaurant["menu"]
@@ -46,6 +48,9 @@ Call behavior:
 - Table slots are {restaurant['booking']['slot_duration_minutes']} minutes.
 - Confirm the final details before saying the booking is confirmed.
 - If you do not hear the customer, ask once briefly, then wait.
+- Calls have a strict {call_duration}-second limit.
+- In the final {warning_seconds} seconds, if prompted by the system, say exactly: "Sorry, the time has finished. Please call back again."
+- After that closing line, do not continue the conversation.
 """
 
 
