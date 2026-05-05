@@ -4,7 +4,7 @@ import base64
 from fastapi import WebSocket
 from stt import DeepgramSTT
 from llm import LLMAgent
-from tts import text_to_speech
+from tts import text_to_speech_stream
 from conversation import ConversationManager
 from config_loader import get_config
 
@@ -28,9 +28,12 @@ async def handle_call(websocket: WebSocket):
     agent = LLMAgent()
     conv = ConversationManager()
     stt_queue: asyncio.Queue = asyncio.Queue()
+    input_queue: asyncio.Queue = asyncio.Queue()
     silence = 0
     chunk_count = 0
+    response_version = 0
     stt_task = None
+    processor_task = None
 
     try:
         await stt.connect()
@@ -39,23 +42,28 @@ async def handle_call(websocket: WebSocket):
         await websocket.close()
         return
 
-    async def send_agent(text: str):
+    async def send_agent(text: str, version: int):
+        if version != response_version or conv.done:
+            return
         conv.add_to_transcript("Agent", text)
-        try:
-            audio = await text_to_speech(text)
-            await websocket.send_json({
-                "type": "audio",
-                "payload": base64.b64encode(audio).decode("utf-8"),
-            })
-        except Exception as e:
-            print(f"[TTS] Error: {e}")
         await websocket.send_json({
             "type": "transcript",
             "speaker": "Agent",
             "text": text,
         })
+        try:
+            async for audio in text_to_speech_stream(text):
+                if version != response_version or conv.done:
+                    print("[TTS] Dropping interrupted audio")
+                    return
+                await websocket.send_json({
+                    "type": "audio",
+                    "payload": base64.b64encode(audio).decode("utf-8"),
+                })
+        except Exception as e:
+            print(f"[TTS] Error: {e}")
 
-    async def process_input(user_text: str):
+    async def process_input(user_text: str, version: int):
         nonlocal silence
         print(f"[User] {user_text}")
         conv.add_to_transcript("Customer", user_text)
@@ -69,9 +77,16 @@ async def handle_call(websocket: WebSocket):
 
         try:
             result = await agent.get_response()
+        except asyncio.CancelledError:
+            print("[LLM] Cancelled by barge-in")
+            raise
         except Exception as e:
             print(f"[LLM] Error: {e}")
-            await send_agent("I'm sorry, I had trouble. Could you repeat that?")
+            await send_agent("I'm sorry, I had trouble. Could you repeat that?", version)
+            return
+
+        if version != response_version or conv.done:
+            print("[Agent] Dropping interrupted response")
             return
 
         if result.get("extracted_booking"):
@@ -79,40 +94,85 @@ async def handle_call(websocket: WebSocket):
             summary = conv.get_booking_summary()
             await send_agent(
                 f"Let me confirm your booking:\n\n{summary}\n\n"
-                f"Does everything look correct? Say 'yes' to confirm or tell me what to change."
+                f"Does everything look correct? Say 'yes' to confirm or tell me what to change.",
+                version,
             )
         elif result.get("done") and result.get("confirmed"):
             conv.confirmed = True
             await send_agent(
                 f"Perfect! Your booking is confirmed. Thank you for choosing {restaurant_name}. "
-                f"We look forward to serving you. Have a wonderful day!"
+                f"We look forward to serving you. Have a wonderful day!",
+                version,
             )
         elif result.get("text"):
             agent_text = result["text"]
             print(f"[Agent] {agent_text}")
-            await send_agent(agent_text)
+            await send_agent(agent_text, version)
 
     async def stt_listener():
         while not conv.done:
             try:
-                transcript = await stt.receive_transcript()
-                if transcript:
-                    await stt_queue.put(transcript)
+                event = await stt.receive_event()
+                if event:
+                    await stt_queue.put(event)
             except Exception:
                 await asyncio.sleep(0.1)
+
+    async def input_processor():
+        nonlocal response_version
+        current_task = None
+        while not conv.done:
+            get_task = asyncio.create_task(input_queue.get())
+            wait_for = [get_task]
+            if current_task:
+                wait_for.append(current_task)
+
+            done, pending = await asyncio.wait(wait_for, return_when=asyncio.FIRST_COMPLETED)
+
+            if get_task in done:
+                user_text = get_task.result()
+                input_queue.task_done()
+                response_version += 1
+                version = response_version
+
+                if current_task and not current_task.done():
+                    current_task.cancel()
+                    await websocket.send_json({"type": "interrupt"})
+
+                current_task = asyncio.create_task(process_input(user_text, version))
+            else:
+                get_task.cancel()
+
+            if current_task and current_task in done:
+                try:
+                    await current_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    print(f"[Processor] Error: {e}")
+                current_task = None
+
+            for task in pending:
+                if task is not current_task:
+                    task.cancel()
+
+        if current_task and not current_task.done():
+            current_task.cancel()
 
     try:
         await send_agent(
             f"Hello, and welcome to {restaurant_name}! "
             f"I'm the automated booking assistant. "
-            f"Are you looking to book a table or place a takeaway order today?"
+            f"Are you looking to book a table or place a takeaway order today?",
+            response_version,
         )
 
         stt_task = asyncio.create_task(stt_listener())
+        processor_task = asyncio.create_task(input_processor())
 
         while not conv.done:
             try:
-                data = await asyncio.wait_for(websocket.receive(), timeout=0.3)
+                data = await asyncio.wait_for(websocket.receive(), timeout=0.05)
                 if "bytes" in data:
                     chunk_count += 1
                     if chunk_count == 1:
@@ -125,8 +185,11 @@ async def handle_call(websocket: WebSocket):
                     if msg.get("type") == "end":
                         conv.done = True
                         break
+                    elif msg.get("type") == "barge_in":
+                        response_version += 1
+                        await websocket.send_json({"type": "interrupt"})
                     elif msg.get("type") == "user_text" and msg.get("text"):
-                        await process_input(msg["text"])
+                        await input_queue.put(msg["text"])
             except asyncio.TimeoutError:
                 pass
             except Exception as e:
@@ -134,17 +197,26 @@ async def handle_call(websocket: WebSocket):
                 break
 
             try:
-                transcript = stt_queue.get_nowait()
-                if transcript.get("is_final") and transcript.get("text"):
-                    await process_input(transcript["text"])
+                stt_event = stt_queue.get_nowait()
+                if stt_event.get("type") == "speech_started":
+                    response_version += 1
+                    await websocket.send_json({"type": "interrupt"})
+                    silence = 0
+                elif (
+                    stt_event.get("type") == "transcript"
+                    and stt_event.get("is_final")
+                    and stt_event.get("text")
+                ):
+                    await input_queue.put(stt_event["text"])
             except asyncio.QueueEmpty:
                 pass
 
             silence += 1
-            if silence >= 200:
+            if silence >= 600 and input_queue.empty():
                 await send_agent(
                     "I'm not hearing you. Please check your microphone and speak again, "
-                    "or type your message in the text box below."
+                    "or type your message in the text box below.",
+                    response_version,
                 )
                 silence = 0
 
@@ -210,6 +282,8 @@ async def handle_call(websocket: WebSocket):
     finally:
         if stt_task and not stt_task.done():
             stt_task.cancel()
+        if processor_task and not processor_task.done():
+            processor_task.cancel()
         await stt.close()
         try:
             await websocket.close()

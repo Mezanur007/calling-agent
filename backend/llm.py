@@ -49,6 +49,7 @@ YOUR BEHAVIOR:
 11. Be patient and friendly. If the customer struggles, help them.
 12. If the customer asks about items not on the menu, politely explain what IS available.
 13. Keep responses concise - 1 to 3 sentences per turn.
+14. Voice-call timing matters. Reply naturally and briefly, usually one sentence unless confirming details.
 """
 
 FUNCTIONS = [
@@ -127,12 +128,12 @@ class LLMAgent:
     async def get_response(self) -> dict:
         """Returns dict with keys: text, extracted_booking, confirmed, done"""
         response = await client.chat.completions.create(
-            model="gpt-4o",
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             messages=self.messages,
             tools=FUNCTIONS,
             tool_choice="auto",
-            temperature=0.7,
-            max_tokens=200,
+            temperature=0.4,
+            max_tokens=120,
         )
 
         choice = response.choices[0]

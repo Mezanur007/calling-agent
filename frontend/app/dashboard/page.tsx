@@ -1,8 +1,9 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
 import OrderCard from "@/components/OrderCard"
 import { RefreshCw, Loader2 } from "lucide-react"
+import { apiUrl } from "@/lib/api"
 
 interface Order {
   id: string
@@ -24,10 +25,35 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true)
   const [connected, setConnected] = useState(false)
 
-  useEffect(() => {
-    fetchOrders()
+  const fetchOrders = useCallback(async () => {
+    setLoading(true)
+    try {
+      const res = await fetch(apiUrl("/api/bookings"))
+      const data = await res.json()
+      setOrders(data)
+    } catch (e) {
+      console.error("Failed to fetch orders:", e)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
 
-    const eventSource = new EventSource("http://localhost:8000/api/bookings/sse")
+  useEffect(() => {
+    const loadInitialOrders = async () => {
+      try {
+        const res = await fetch(apiUrl("/api/bookings"))
+        const data = await res.json()
+        setOrders(data)
+      } catch (e) {
+        console.error("Failed to fetch orders:", e)
+      } finally {
+        setLoading(false)
+      }
+    }
+
+    loadInitialOrders()
+
+    const eventSource = new EventSource(apiUrl("/api/bookings/sse"))
 
     eventSource.onopen = () => setConnected(true)
     eventSource.onerror = () => setConnected(false)
@@ -43,19 +69,6 @@ export default function DashboardPage() {
       eventSource.close()
     }
   }, [])
-
-  const fetchOrders = async () => {
-    setLoading(true)
-    try {
-      const res = await fetch("http://localhost:8000/api/bookings")
-      const data = await res.json()
-      setOrders(data)
-    } catch (e) {
-      console.error("Failed to fetch orders:", e)
-    } finally {
-      setLoading(false)
-    }
-  }
 
   return (
     <div className="min-h-[calc(100vh-73px)] p-6">

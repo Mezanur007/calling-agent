@@ -2,10 +2,28 @@
 
 import { useState, useRef, useEffect, useCallback } from "react"
 import { Phone, PhoneOff, Loader2, Send } from "lucide-react"
+import { realtimeCallUrl } from "@/lib/api"
 
 interface Message {
   speaker: "Agent" | "Customer"
   text: string
+}
+
+type CallStatus = "idle" | "connecting" | "connected" | "ended"
+
+type RealtimeEvent = {
+  type?: string
+  delta?: string
+  transcript?: string
+  item_id?: string
+  item?: {
+    id?: string
+    role?: string
+    content?: Array<{ text?: string; transcript?: string }>
+  }
+  error?: {
+    message?: string
+  }
 }
 
 export default function CallButton({
@@ -13,198 +31,304 @@ export default function CallButton({
   onStatusChange,
 }: {
   onTranscript: (msgs: Message[]) => void
-  onStatusChange: (s: "idle" | "connecting" | "connected" | "ended") => void
+  onStatusChange: (s: CallStatus) => void
 }) {
-  const [status, setStatus] = useState<"idle" | "connecting" | "connected" | "ended">("idle")
+  const [status, setStatus] = useState<CallStatus>("idle")
   const [error, setError] = useState<string | null>(null)
   const [micLevel, setMicLevel] = useState(0)
   const [textInput, setTextInput] = useState("")
 
-  const ctxRef = useRef<AudioContext | null>(null)
-  const wsRef = useRef<WebSocket | null>(null)
+  const pcRef = useRef<RTCPeerConnection | null>(null)
+  const dcRef = useRef<RTCDataChannel | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
-  const procRef = useRef<ScriptProcessorNode | null>(null)
+  const remoteAudioRef = useRef<HTMLAudioElement | null>(null)
+  const analyserCtxRef = useRef<AudioContext | null>(null)
+  const analyserFrameRef = useRef<number | null>(null)
   const msgsRef = useRef<Message[]>([])
+  const customerDraftsRef = useRef<Map<string, string>>(new Map())
+  const agentDraftsRef = useRef<Map<string, string>>(new Map())
+  const draftIndexesRef = useRef<Map<string, number>>(new Map())
+  const finalizedItemsRef = useRef<Set<string>>(new Set())
   const cbRef = useRef({ onTranscript, onStatusChange })
-  cbRef.current = { onTranscript, onStatusChange }
 
-  const stopAll = useCallback(() => {
-    procRef.current?.disconnect()
-    procRef.current = null
-    streamRef.current?.getTracks().forEach((t) => t.stop())
-    streamRef.current = null
-    ctxRef.current?.close().catch(() => {})
-    ctxRef.current = null
-    wsRef.current?.close()
-    wsRef.current = null
+  useEffect(() => {
+    cbRef.current = { onTranscript, onStatusChange }
+  }, [onTranscript, onStatusChange])
+
+  const setCallStatus = useCallback((nextStatus: CallStatus) => {
+    setStatus(nextStatus)
+    cbRef.current.onStatusChange(nextStatus)
+  }, [])
+
+  const publishMessages = useCallback(() => {
+    cbRef.current.onTranscript([...msgsRef.current])
+  }, [])
+
+  const appendMessage = useCallback((speaker: Message["speaker"], text: string, itemId?: string) => {
+    const clean = text.trim()
+    if (!clean) return
+
+    if (itemId) {
+      if (finalizedItemsRef.current.has(itemId)) return
+      finalizedItemsRef.current.add(itemId)
+
+      const draftIndex = draftIndexesRef.current.get(itemId)
+      if (draftIndex !== undefined) {
+        msgsRef.current = msgsRef.current.map((message, index) => (
+          index === draftIndex ? { speaker, text: clean } : message
+        ))
+        draftIndexesRef.current.delete(itemId)
+        publishMessages()
+        return
+      }
+    }
+
+    msgsRef.current = [...msgsRef.current, { speaker, text: clean }]
+    publishMessages()
+  }, [publishMessages])
+
+  const updateDraft = useCallback((itemId: string, speaker: Message["speaker"], text: string) => {
+    const clean = text.trim()
+    if (!clean || finalizedItemsRef.current.has(itemId)) return
+
+    const draftText = `${clean}...`
+    const draftIndex = draftIndexesRef.current.get(itemId)
+
+    if (draftIndex !== undefined) {
+      msgsRef.current = msgsRef.current.map((message, index) => (
+        index === draftIndex ? { speaker, text: draftText } : message
+      ))
+    } else {
+      draftIndexesRef.current.set(itemId, msgsRef.current.length)
+      msgsRef.current = [...msgsRef.current, { speaker, text: draftText }]
+    }
+
+    publishMessages()
+  }, [publishMessages])
+
+  const stopMicMeter = useCallback(() => {
+    if (analyserFrameRef.current !== null) {
+      cancelAnimationFrame(analyserFrameRef.current)
+      analyserFrameRef.current = null
+    }
+    analyserCtxRef.current?.close().catch(() => {})
+    analyserCtxRef.current = null
     setMicLevel(0)
   }, [])
+
+  const stopAll = useCallback(() => {
+    stopMicMeter()
+    dcRef.current?.close()
+    dcRef.current = null
+    pcRef.current?.close()
+    pcRef.current = null
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+    streamRef.current = null
+    if (remoteAudioRef.current) {
+      remoteAudioRef.current.pause()
+      remoteAudioRef.current.srcObject = null
+    }
+  }, [stopMicMeter])
 
   const endCall = useCallback(() => {
     stopAll()
-    setStatus("ended")
-    cbRef.current.onStatusChange("ended")
-  }, [stopAll])
+    setCallStatus("ended")
+  }, [setCallStatus, stopAll])
 
-  const playBuffer = useCallback(async (pcm16Base64: string) => {
-    const ctx = ctxRef.current
-    if (!ctx) return
+  const startMicMeter = useCallback((stream: MediaStream) => {
+    stopMicMeter()
+    const ctx = new AudioContext()
+    const source = ctx.createMediaStreamSource(stream)
+    const analyser = ctx.createAnalyser()
+    analyser.fftSize = 512
+    source.connect(analyser)
+    analyserCtxRef.current = ctx
 
-    if (ctx.state === "suspended") await ctx.resume()
-
-    const raw = atob(pcm16Base64)
-    const len = raw.length
-    const i16 = new Int16Array(len / 2)
-    for (let i = 0; i < len / 2; i++) {
-      i16[i] = raw.charCodeAt(i * 2) | (raw.charCodeAt(i * 2 + 1) << 8)
+    const data = new Uint8Array(analyser.fftSize)
+    const tick = () => {
+      analyser.getByteTimeDomainData(data)
+      let peak = 0
+      for (const value of data) {
+        const centered = Math.abs(value - 128) / 128
+        if (centered > peak) peak = centered
+      }
+      setMicLevel(Math.min(100, Math.round(peak * 250)))
+      analyserFrameRef.current = requestAnimationFrame(tick)
     }
-    const f32 = new Float32Array(i16.length)
-    for (let i = 0; i < i16.length; i++) {
-      f32[i] = i16[i] / 32768
+    tick()
+  }, [stopMicMeter])
+
+  const handleRealtimeEvent = useCallback((event: RealtimeEvent) => {
+    if (event.type === "error") {
+      setError(event.error?.message || "Realtime voice session error")
+      return
     }
 
-    const buf = ctx.createBuffer(1, f32.length, 24000)
-    buf.getChannelData(0).set(f32)
-    const src = ctx.createBufferSource()
-    src.buffer = buf
-    src.connect(ctx.destination)
-    src.start()
-  }, [])
+    if (event.type === "conversation.item.input_audio_transcription.delta") {
+      const itemId = event.item_id || "current-user"
+      const next = `${customerDraftsRef.current.get(itemId) || ""}${event.delta || ""}`
+      customerDraftsRef.current.set(itemId, next)
+      updateDraft(itemId, "Customer", next)
+      return
+    }
+
+    if (event.type === "conversation.item.input_audio_transcription.completed") {
+      const itemId = event.item_id || "current-user"
+      customerDraftsRef.current.delete(itemId)
+      appendMessage("Customer", event.transcript || "", itemId)
+      return
+    }
+
+    if (event.type === "response.output_audio_transcript.delta") {
+      const itemId = event.item_id || "current-agent"
+      const next = `${agentDraftsRef.current.get(itemId) || ""}${event.delta || ""}`
+      agentDraftsRef.current.set(itemId, next)
+      updateDraft(itemId, "Agent", next)
+      return
+    }
+
+    if (event.type === "response.output_audio_transcript.done") {
+      const itemId = event.item_id || "current-agent"
+      agentDraftsRef.current.delete(itemId)
+      appendMessage("Agent", event.transcript || "", itemId)
+      return
+    }
+
+    if (event.type === "conversation.item.done" && event.item?.role === "assistant") {
+      const itemId = event.item.id || "current-agent"
+      const content = event.item.content?.find((part) => part.transcript || part.text)
+      appendMessage("Agent", content?.transcript || content?.text || "", itemId)
+    }
+  }, [appendMessage, updateDraft])
 
   const startCall = useCallback(async () => {
     setError(null)
-    setStatus("connecting")
-    cbRef.current.onStatusChange("connecting")
+    setCallStatus("connecting")
     msgsRef.current = []
-    setMicLevel(0)
+    customerDraftsRef.current.clear()
+    agentDraftsRef.current.clear()
+    draftIndexesRef.current.clear()
+    finalizedItemsRef.current.clear()
+    publishMessages()
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      })
       streamRef.current = stream
-      console.log("[Stream] Microphone acquired", stream.getAudioTracks()[0].label)
+      startMicMeter(stream)
 
-      const ctx = new AudioContext()
-      ctxRef.current = ctx
-      console.log(`[AudioCtx] Created, state=${ctx.state}, sampleRate=${ctx.sampleRate}`)
+      const pc = new RTCPeerConnection()
+      pcRef.current = pc
 
-      const ws = new WebSocket("ws://localhost:8000/ws/call")
-      wsRef.current = ws
-      ws.binaryType = "arraybuffer"
+      const audio = document.createElement("audio")
+      audio.autoplay = true
+      audio.setAttribute("playsinline", "true")
+      remoteAudioRef.current = audio
+      pc.ontrack = (event) => {
+        audio.srcObject = event.streams[0]
+        audio.play().catch(() => {})
+      }
 
-      ws.onmessage = (e) => {
+      stream.getAudioTracks().forEach((track) => pc.addTrack(track, stream))
+
+      const dc = pc.createDataChannel("oai-events")
+      dcRef.current = dc
+
+      dc.onmessage = (messageEvent) => {
         try {
-          const msg = JSON.parse(e.data)
-          if (msg.type === "audio" && msg.payload) {
-            playBuffer(msg.payload)
-          }
-          if (msg.type === "transcript") {
-            console.log(`[${msg.speaker}] ${msg.text}`)
-            msgsRef.current = [...msgsRef.current, { speaker: msg.speaker, text: msg.text }]
-            cbRef.current.onTranscript([...msgsRef.current])
-          }
-          if (msg.type === "error") setError(msg.message)
+          handleRealtimeEvent(JSON.parse(messageEvent.data))
         } catch {}
       }
-      ws.onclose = () => endCall()
-      ws.onerror = () => {
-        setError("Connection failed. Is the backend running on port 8000?")
-        endCall()
+
+      dc.onopen = () => {
+        setCallStatus("connected")
+        dc.send(JSON.stringify({
+          type: "response.create",
+          response: {
+            instructions: "Greet the caller warmly and ask whether they want to book a table or place a takeaway order.",
+          },
+        }))
       }
 
-      await new Promise<void>((resolve, reject) => {
-        ws.onopen = () => {
-          ws.send(JSON.stringify({ type: "init", sampleRate: ctx.sampleRate }))
-          console.log("[WS] Connected, sent init")
-          resolve()
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+          setError("Realtime voice connection dropped.")
+          endCall()
         }
-        setTimeout(() => reject(new Error("WebSocket timeout")), 5000)
+      }
+
+      const offer = await pc.createOffer()
+      await pc.setLocalDescription(offer)
+
+      const response = await fetch(realtimeCallUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/sdp" },
+        body: offer.sdp,
       })
 
-      if (ctx.state === "suspended") {
-        console.log("[AudioCtx] Resuming...")
-        await ctx.resume()
-        console.log(`[AudioCtx] State now: ${ctx.state}`)
+      if (!response.ok) {
+        throw new Error(await response.text())
       }
 
-      const source = ctx.createMediaStreamSource(stream)
-      const proc = ctx.createScriptProcessor(4096, 1, 1)
-      procRef.current = proc
-      source.connect(proc)
-      proc.connect(ctx.destination)
-
-      let n = 0
-      let maxVal = 0
-      proc.onaudioprocess = (ev) => {
-        n++
-        const input = ev.inputBuffer.getChannelData(0)
-        let peak = 0
-        for (let i = 0; i < input.length; i++) {
-          const v = Math.abs(input[i])
-          if (v > peak) peak = v
-        }
-        if (peak > maxVal) maxVal = peak
-
-        if (n === 1 || n % 100 === 0) {
-          console.log(`[Mic] Chunk #${n}, peak=${peak.toFixed(3)}, max=${maxVal.toFixed(3)}`)
-        }
-
-        const output = ev.outputBuffer.getChannelData(0)
-        output.fill(0)
-
-        const i16 = new Int16Array(input.length)
-        for (let i = 0; i < input.length; i++) {
-          const s = Math.max(-1, Math.min(1, input[i]))
-          i16[i] = s < 0 ? s * 32768 : s * 32767
-        }
-
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(new Uint8Array(i16.buffer))
-        }
-      }
-
-      setStatus("connected")
-      cbRef.current.onStatusChange("connected")
-      console.log("[Call] Ready - start speaking")
-    } catch (err: any) {
-      console.error("[Call] Error:", err)
-      setError(err.message || "Failed to start")
+      await pc.setRemoteDescription({
+        type: "answer",
+        sdp: await response.text(),
+      })
+    } catch (err) {
+      console.error("[RealtimeCall] Error:", err)
+      setError(err instanceof Error ? err.message : "Failed to start realtime voice")
       endCall()
     }
-  }, [endCall, playBuffer])
+  }, [endCall, handleRealtimeEvent, publishMessages, setCallStatus, startMicMeter])
 
   const sendText = useCallback(() => {
     const text = textInput.trim()
-    if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
-    wsRef.current.send(JSON.stringify({ type: "user_text", text }))
-    msgsRef.current = [...msgsRef.current, { speaker: "Customer", text }]
-    cbRef.current.onTranscript([...msgsRef.current])
+    const dc = dcRef.current
+    if (!text || !dc || dc.readyState !== "open") return
+
+    dc.send(JSON.stringify({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text }],
+      },
+    }))
+    dc.send(JSON.stringify({ type: "response.create" }))
+
+    appendMessage("Customer", text)
     setTextInput("")
-  }, [textInput])
+  }, [appendMessage, textInput])
 
   useEffect(() => () => stopAll(), [stopAll])
-
-  const btn = (label: string, icon: React.ReactNode, cls: string, onClick: () => void) => (
-    <button
-      onClick={onClick}
-      className={`flex items-center gap-3 px-8 py-4 rounded-full text-lg font-semibold transition-all hover:scale-105 active:scale-95 shadow-lg ${cls}`}
-    >
-      {icon}
-      {label}
-    </button>
-  )
 
   return (
     <div className="flex flex-col items-center gap-4">
       {error && (
         <div className="text-red-400 text-sm bg-red-900/20 rounded-lg px-4 py-2 text-center max-w-md">{error}</div>
       )}
-      {status === "idle" &&
-        btn("Call Now", <Phone className="w-5 h-5" />, "bg-green-600 hover:bg-green-700 text-white shadow-green-600/25", startCall)}
+
+      {status === "idle" && (
+        <button
+          onClick={startCall}
+          className="flex items-center gap-3 px-8 py-4 rounded-full text-lg font-semibold transition-all hover:scale-105 active:scale-95 shadow-lg bg-green-600 hover:bg-green-700 text-white shadow-green-600/25"
+        >
+          <Phone className="w-5 h-5" />
+          Call Now
+        </button>
+      )}
+
       {status === "connecting" && (
         <div className="flex items-center gap-3 px-8 py-4 bg-yellow-600/80 text-white rounded-full text-lg font-semibold">
           <Loader2 className="w-5 h-5 animate-spin" /> Connecting...
         </div>
       )}
+
       {status === "connected" && (
         <>
           <div className="flex items-center gap-2">
@@ -216,18 +340,27 @@ export default function CallButton({
               />
             </div>
           </div>
-          {btn("End Call", <PhoneOff className="w-5 h-5" />, "bg-red-600 hover:bg-red-700 text-white shadow-red-600/25", endCall)}
+          <button
+            onClick={endCall}
+            className="flex items-center gap-3 px-8 py-4 rounded-full text-lg font-semibold transition-all hover:scale-105 active:scale-95 shadow-lg bg-red-600 hover:bg-red-700 text-white shadow-red-600/25"
+          >
+            <PhoneOff className="w-5 h-5" />
+            End Call
+          </button>
           <p className="text-green-400 text-sm flex items-center gap-2">
             <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
-            Call in progress — speak now or type below
+            Realtime call active — speak naturally
           </p>
           <form
-            onSubmit={(e) => { e.preventDefault(); sendText() }}
+            onSubmit={(event) => {
+              event.preventDefault()
+              sendText()
+            }}
             className="flex gap-2 w-full max-w-md"
           >
             <input
               value={textInput}
-              onChange={(e) => setTextInput(e.target.value)}
+              onChange={(event) => setTextInput(event.target.value)}
               placeholder="Type your message..."
               className="flex-1 px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:border-green-500"
             />
@@ -240,8 +373,16 @@ export default function CallButton({
           </form>
         </>
       )}
-      {status === "ended" &&
-        btn("Call Again", <Phone className="w-5 h-5" />, "bg-green-600 hover:bg-green-700 text-white shadow-green-600/25", startCall)}
+
+      {status === "ended" && (
+        <button
+          onClick={startCall}
+          className="flex items-center gap-3 px-8 py-4 rounded-full text-lg font-semibold transition-all hover:scale-105 active:scale-95 shadow-lg bg-green-600 hover:bg-green-700 text-white shadow-green-600/25"
+        >
+          <Phone className="w-5 h-5" />
+          Call Again
+        </button>
+      )}
     </div>
   )
 }

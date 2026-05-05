@@ -3,7 +3,7 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +12,7 @@ from database import init_db, get_db
 from models import Booking
 from ws_handler import handle_call
 from dotenv import load_dotenv
+from realtime import create_realtime_call
 
 load_dotenv()
 
@@ -29,7 +30,11 @@ app = FastAPI(title="Calling Agent", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv("CORS_ORIGINS", "*").split(",")
+        if origin.strip()
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,6 +44,11 @@ app.add_middleware(
 @app.websocket("/ws/call")
 async def ws_call(websocket: WebSocket):
     await handle_call(websocket)
+
+
+@app.post("/api/realtime/call")
+async def realtime_call(request: Request):
+    return await create_realtime_call(request)
 
 
 @app.get("/api/bookings")
